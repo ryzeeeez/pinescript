@@ -1,0 +1,495 @@
+//@version=6
+indicator("SMC Power Zones (FVG/iFVG/OB) [Quant]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mini guide (FR):
+// 1) Régle d'abord ATR/RVOL puis ajuste les poids de score.
+// 2) Active les confirmations seulement si tu veux un filtrage strict.
+// 3) MTF utilise request.security lookahead_off (non repaint, mais approximation HTF).
+// Limites: Pine ne voit pas l'orderflow réel; tout est proxifié via volume/structure.
+// Avertissement: Ceci n'est pas un conseil financier.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// === Inputs: Detection FVG ===
+minGapMode        = input.string("ATR", "FVG min gap mode", options=["Points","%","ATR"], group="1. Detection FVG")
+minGapValue       = input.float(0.5, "FVG min gap value", step=0.1, group="1. Detection FVG")
+requireDisplacement = input.bool(true, "Require displacement", group="1. Detection FVG")
+dispBodyATRmin    = input.float(0.6, "Disp body/ATR min", step=0.1, group="1. Detection FVG")
+dispRangeATRmin   = input.float(1.0, "Disp range/ATR min", step=0.1, group="1. Detection FVG")
+requireTrendFilter = input.bool(false, "Require trend filter", group="1. Detection FVG")
+requireStructureContext = input.bool(false, "Require BOS context", group="1. Detection FVG")
+
+// === Inputs: Mitigation & States ===
+mitigationMode    = input.string("% penetration", "Mitigation mode", options=["touch","% penetration","close inside"], group="2. Mitigation & States")
+mitigationPercent = input.float(50, "Mitigation %", minval=0, maxval=100, group="2. Mitigation & States")
+invalidateMode    = input.string("full fill", "Invalidate mode", options=["close beyond","full fill","wick beyond"], group="2. Mitigation & States")
+expireBars        = input.int(400, "Expire after bars", minval=50, group="2. Mitigation & States")
+
+// === Inputs: iFVG ===
+flipTrigger       = input.string("close beyond midpoint", "iFVG flip trigger", options=["BOS","CHoCH","close beyond midpoint","impulse away"], group="3. Detection iFVG")
+flipLookback      = input.int(50, "Flip lookback bars", minval=10, group="3. Detection iFVG")
+requireRetestAfterFlip = input.bool(true, "Require retest after flip", group="3. Detection iFVG")
+
+// === Inputs: OB ===
+obDefinition      = input.string("last opposite candle", "OB definition", options=["last opposite candle","last opposite candle incl. wick sweep"], group="4. Detection OB")
+obZoneType        = input.string("full candle", "OB zone type", options=["body","wick","full candle"], group="4. Detection OB")
+bosMethod         = input.string("pivot break", "BOS method", options=["pivot break","swing break","fractal"], group="4. Detection OB")
+pivotLeft         = input.int(3, "Pivot left", minval=1, group="4. Detection OB")
+pivotRight        = input.int(3, "Pivot right", minval=1, group="4. Detection OB")
+minImpulseATR     = input.float(1.2, "Min impulse ATR", step=0.1, group="4. Detection OB")
+minImpulsePercent = input.float(0.8, "Min impulse %", step=0.1, group="4. Detection OB")
+impulseBars       = input.int(3, "Impulse bars", minval=1, group="4. Detection OB")
+obMustBeNearSwing = input.float(1.5, "OB max dist to swing (ATR)", step=0.1, group="4. Detection OB")
+
+// === Inputs: Scoring Weights ===
+volLen            = input.int(20, "RVOL length", group="5. Scoring weights")
+useZScoreVol      = input.bool(false, "Use volume z-score", group="5. Scoring weights")
+zVolLen           = input.int(50, "Z-score length", group="5. Scoring weights")
+atrLen            = input.int(14, "ATR length", group="5. Scoring weights")
+rocLen            = input.int(5, "ROC length", group="5. Scoring weights")
+emaLen            = input.int(50, "EMA length", group="5. Scoring weights")
+useHTFTrend       = input.bool(false, "Use HTF EMA trend", group="5. Scoring weights")
+htfTf             = input.timeframe("240", "HTF TF", group="5. Scoring weights")
+
+wVol              = input.float(0.15, "Weight Volume", minval=0, maxval=1, group="5. Scoring weights")
+wDisp             = input.float(0.15, "Weight Displacement", minval=0, maxval=1, group="5. Scoring weights")
+wStruct           = input.float(0.2, "Weight Structure", minval=0, maxval=1, group="5. Scoring weights")
+wLiq              = input.float(0.15, "Weight Liquidity", minval=0, maxval=1, group="5. Scoring weights")
+wReject           = input.float(0.15, "Weight Rejection", minval=0, maxval=1, group="5. Scoring weights")
+wFresh            = input.float(0.1, "Weight Freshness", minval=0, maxval=1, group="5. Scoring weights")
+wAge              = input.float(0.05, "Weight Age", minval=0, maxval=1, group="5. Scoring weights")
+wConfluence       = input.float(0.05, "Weight Confluence", minval=0, maxval=1, group="5. Scoring weights")
+
+// === Inputs: Filters & Structure ===
+useStructure      = input.bool(true, "Use structure filter", group="6. Filters")
+eqhToleranceATR   = input.float(0.25, "Equal highs/lows tolerance (ATR)", step=0.05, group="6. Filters")
+usePDH_PDL        = input.bool(true, "Use prev day high/low", group="6. Filters")
+useSessionLevels  = input.bool(true, "Use session high/low", group="6. Filters")
+
+// === Inputs: Display ===
+showLabels        = input.bool(true, "Show labels", group="7. Display")
+showMidline       = input.bool(false, "Show midline", group="7. Display")
+showEntryLine     = input.bool(false, "Show entry line", group="7. Display")
+extendRight       = input.bool(true, "Extend zones right", group="7. Display")
+minScoreToShow    = input.int(30, "Min score to show", minval=0, maxval=100, group="7. Display")
+strongThreshold   = input.int(75, "Strong threshold", minval=0, maxval=100, group="7. Display")
+maxZonesTotal     = input.int(60, "Max zones total", minval=10, group="7. Display")
+maxZonesPerType   = input.int(25, "Max zones per type", minval=5, group="7. Display")
+maxLabels         = input.int(80, "Max labels", minval=10, group="7. Display")
+showOnlyTopN      = input.int(0, "Show only Top N (0=all)", minval=0, group="7. Display")
+showClosestOnly   = input.bool(false, "Show closest zone only", group="7. Display")
+
+// === Inputs: Alerts ===
+minScoreToAlert   = input.int(60, "Min score to alert", minval=0, maxval=100, group="8. Alerts")
+confirmVol        = input.bool(false, "Confirm volume", group="8. Alerts")
+confirmStruct     = input.bool(false, "Confirm structure", group="8. Alerts")
+confirmReject     = input.bool(false, "Confirm rejection", group="8. Alerts")
+confirmMomentum   = input.bool(false, "Confirm momentum", group="8. Alerts")
+confirmMitigation = input.bool(false, "Confirm mitigation", group="8. Alerts")
+
+// === Inputs: MTF ===
+useMTF            = input.bool(false, "Use MTF zones", group="9. MTF")
+mtfTf             = input.timeframe("240", "MTF TF", group="9. MTF")
+
+// === Inputs: Performance ===
+maxLoop           = input.int(80, "Max loop iterations", minval=20, group="10. Performance")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+atr = ta.atr(atrLen)
+ema = ta.ema(close, emaLen)
+htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaLen), barmerge.gaps_off, barmerge.lookahead_off)
+trendBull = useHTFTrend ? close > htfEma : close > ema
+trendBear = useHTFTrend ? close < htfEma : close < ema
+
+rvol = volume / ta.sma(volume, volLen)
+volZ = useZScoreVol ? (volume - ta.sma(volume, zVolLen)) / ta.stdev(volume, zVolLen) : na
+roc = ta.roc(close, rocLen)
+
+f_gap_ok(gap) =>
+    minGapMode == "Points" ? gap >= minGapValue :
+     minGapMode == "%" ? gap >= close * (minGapValue/100.0) :
+     gap >= atr * minGapValue
+
+f_disp_ok() =>
+    body = math.abs(close - open)
+    rng = high - low
+    body/atr >= dispBodyATRmin and rng/atr >= dispRangeATRmin
+
+f_mid(top, bottom) => (top + bottom) * 0.5
+
+// Structure (simple BOS via pivots)
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+var float lastSwingHigh = na
+var float lastSwingLow = na
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+bosUp = not na(lastSwingHigh) and close > lastSwingHigh
+bosDn = not na(lastSwingLow) and close < lastSwingLow
+
+// Liquidity proxies
+pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+sessHigh = ta.highest(high, 50)
+sessLow = ta.lowest(low, 50)
+
+// Score normalization helpers
+f_norm01(v, minv, maxv) => math.min(1.0, math.max(0.0, (v - minv) / math.max(0.0001, maxv - minv)))
+
+// calcScore(type, dir, top, bottom, createdBar)
+// type: 0=FVG,1=iFVG,2=OB
+f_calcScore(_type, _dir, _top, _bot, _createdBar, _touches, _structHit, _rejection, _confluence) =>
+    // Volume
+    vScore = useZScoreVol ? f_norm01(volZ, -1.0, 3.0) : f_norm01(rvol, 0.8, 2.5)
+    // Displacement
+    body = math.abs(close - open)
+    rng = high - low
+    dispScore = f_norm01(body/atr, 0.2, 2.0) * 0.6 + f_norm01(rng/atr, 0.5, 3.0) * 0.4
+    // Structure
+    structScore = _structHit ? 1.0 : 0.4
+    // Liquidity
+    eqh = not na(lastSwingHigh) and math.abs(_top - lastSwingHigh) <= atr * eqhToleranceATR
+    eql = not na(lastSwingLow) and math.abs(_bot - lastSwingLow) <= atr * eqhToleranceATR
+    pd = usePDH_PDL and (math.abs(_top - pdh) <= atr * eqhToleranceATR or math.abs(_bot - pdl) <= atr * eqhToleranceATR)
+    sess = useSessionLevels and (math.abs(_top - sessHigh) <= atr * eqhToleranceATR or math.abs(_bot - sessLow) <= atr * eqhToleranceATR)
+    liqScore = f_norm01((eqh?1:0) + (eql?1:0) + (pd?1:0) + (sess?1:0), 0, 3)
+    // Rejection quality (1 if reaction, else 0.4)
+    rejScore = _rejection ? 1.0 : 0.4
+    // Freshness
+    freshScore = math.max(0.0, 1.0 - (_touches * 0.25))
+    // Age decay
+    ageBars = bar_index - _createdBar
+    ageScore = math.exp(-ageBars / math.max(1.0, 100.0))
+    // Confluence
+    confScore = _confluence ? 1.0 : 0.4
+
+    weighted = vScore*wVol + dispScore*wDisp + structScore*wStruct + liqScore*wLiq + rejScore*wReject + freshScore*wFresh + ageScore*wAge + confScore*wConfluence
+    score = math.round(100 * f_norm01(weighted, 0, (wVol+wDisp+wStruct+wLiq+wReject+wFresh+wAge+wConfluence)))
+    [score, vScore, dispScore, structScore, liqScore, rejScore, freshScore, ageScore, confScore]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data structures
+// ─────────────────────────────────────────────────────────────────────────────
+var box[] zoneBoxes = array.new_box()
+var label[] zoneLabels = array.new_label()
+var line[] zoneLines = array.new_line()
+var int[] zoneType = array.new_int()
+var int[] zoneDir = array.new_int()
+var float[] zoneTop = array.new_float()
+var float[] zoneBot = array.new_float()
+var int[] zoneCreated = array.new_int()
+var int[] zoneScore = array.new_int()
+var int[] zoneTouches = array.new_int()
+var int[] zoneState = array.new_int() // 0 fresh,1 partial,2 full,3 expired
+var bool[] zoneIsIFVG = array.new_bool()
+var bool newIFVGBar = false
+var bool newRetestBar = false
+var int newZoneScore = na
+
+f_zoneCountByType(_type) =>
+    count = 0
+    if array.size(zoneType) > 0
+        for i = 0 to array.size(zoneType)-1
+            if array.get(zoneType, i) == _type
+                count += 1
+    count
+
+f_remove_idx(_idx) =>
+    b = array.get(zoneBoxes, _idx)
+    if not na(b)
+        box.delete(b)
+    lb = array.get(zoneLabels, _idx)
+    if not na(lb)
+        label.delete(lb)
+    ln = array.get(zoneLines, _idx)
+    if not na(ln)
+        line.delete(ln)
+    array.remove(zoneBoxes, _idx)
+    array.remove(zoneLabels, _idx)
+    array.remove(zoneLines, _idx)
+    array.remove(zoneType, _idx)
+    array.remove(zoneDir, _idx)
+    array.remove(zoneTop, _idx)
+    array.remove(zoneBot, _idx)
+    array.remove(zoneCreated, _idx)
+    array.remove(zoneScore, _idx)
+    array.remove(zoneTouches, _idx)
+    array.remove(zoneState, _idx)
+    array.remove(zoneIsIFVG, _idx)
+
+f_prune_type(_type) =>
+    while f_zoneCountByType(_type) > maxZonesPerType
+        if array.size(zoneType) > 0
+            for i = 0 to array.size(zoneType)-1
+                if array.get(zoneType, i) == _type
+                    f_remove_idx(i)
+                    break
+
+f_prune() =>
+    while array.size(zoneBoxes) > maxZonesTotal
+        b = array.shift(zoneBoxes)
+        if not na(b)
+            box.delete(b)
+        if array.size(zoneLabels) > 0
+            lb = array.shift(zoneLabels)
+            if not na(lb)
+                label.delete(lb)
+        if array.size(zoneLines) > 0
+            ln = array.shift(zoneLines)
+            if not na(ln)
+                line.delete(ln)
+        array.shift(zoneType)
+        array.shift(zoneDir)
+        array.shift(zoneTop)
+        array.shift(zoneBot)
+        array.shift(zoneCreated)
+        array.shift(zoneScore)
+        array.shift(zoneTouches)
+        array.shift(zoneState)
+        array.shift(zoneIsIFVG)
+
+f_prune_labels() =>
+    while array.size(zoneLabels) > maxLabels
+        lb = array.shift(zoneLabels)
+        if not na(lb)
+            label.delete(lb)
+
+f_makeColor(_dir, _score) =>
+    base = _dir == 1 ? color.green : color.red
+    alpha = math.round(90 - (math.min(_score, 100) * 0.6))
+    color.new(base, alpha)
+
+f_borderWidth(_score) => _score >= strongThreshold ? 2 : 1
+
+newIFVGBar := false
+newRetestBar := false
+newZoneScore := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Detection FVG
+// ─────────────────────────────────────────────────────────────────────────────
+newFvgBull = bar_index >= 2 and low > high[2]
+newFvgBear = bar_index >= 2 and high < low[2]
+
+fvgGapBull = low - high[2]
+fvgGapBear = low[2] - high
+
+fvgBullOk = newFvgBull and f_gap_ok(fvgGapBull) and (not requireDisplacement or f_disp_ok()) and (not requireTrendFilter or trendBull) and (not requireStructureContext or bosUp)
+fvgBearOk = newFvgBear and f_gap_ok(fvgGapBear) and (not requireDisplacement or f_disp_ok()) and (not requireTrendFilter or trendBear) and (not requireStructureContext or bosDn)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OB detection (simplified, robust)
+// ─────────────────────────────────────────────────────────────────────────────
+impulseUp = bar_index >= impulseBars and ta.change(close, impulseBars) / close[impulseBars] * 100 >= minImpulsePercent and (high - low)/atr >= minImpulseATR
+impulseDn = bar_index >= impulseBars and ta.change(close, impulseBars) / close[impulseBars] * 100 <= -minImpulsePercent and (high - low)/atr >= minImpulseATR
+
+obBull = impulseUp and bar_index >= 1 and close > open and close > ta.highest(high, pivotLeft)
+obBear = impulseDn and bar_index >= 1 and close < open and close < ta.lowest(low, pivotLeft)
+
+// locate last opposite candle
+var float obTop = na
+var float obBot = na
+var int obDir = 0
+if obBull
+    obDir := 1
+    obTop := obZoneType == "body" ? math.max(open[1], close[1]) : (obZoneType == "wick" ? high[1] : high[1])
+    obBot := obZoneType == "body" ? math.min(open[1], close[1]) : (obZoneType == "wick" ? low[1] : low[1])
+if obBear
+    obDir := -1
+    obTop := obZoneType == "body" ? math.max(open[1], close[1]) : (obZoneType == "wick" ? high[1] : high[1])
+    obBot := obZoneType == "body" ? math.min(open[1], close[1]) : (obZoneType == "wick" ? low[1] : low[1])
+
+obOk = (obBull or obBear) and (not useStructure or (obBull ? bosUp : bosDn))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zone creation
+// ─────────────────────────────────────────────────────────────────────────────
+createZone(_type, _dir, _top, _bot, _isIFVG) =>
+    structHit = _dir == 1 ? bosUp : bosDn
+    rejection = false
+    confluence = false
+    touches = 0
+    [score, vScore, dScore, sScore, lScore, rScore, fScore, aScore, cScore] = f_calcScore(_type, _dir, _top, _bot, bar_index, touches, structHit, rejection, confluence)
+    if score >= minScoreToShow
+        if showOnlyTopN > 0
+            if array.size(zoneScore) >= showOnlyTopN
+                minIdx = 0
+                minScore = array.get(zoneScore, 0)
+                for i = 1 to array.size(zoneScore)-1
+                    if array.get(zoneScore, i) < minScore
+                        minScore := array.get(zoneScore, i)
+                        minIdx := i
+                if score > minScore
+                    f_remove_idx(minIdx)
+                else
+                    return
+
+        c = f_makeColor(_dir, score)
+        bx = box.new(bar_index, _top, bar_index + 1, _bot, bgcolor=c, border_color=color.new(color.gray, 0), extend=extendRight ? extend.right : extend.none)
+        box.set_border_width(bx, f_borderWidth(score))
+        label lb = na
+        if showLabels
+            labelText = (_type == 0 ? "FVG" : _type == 1 ? "iFVG" : "OB") + " " + str.tostring(score)
+            lb := label.new(bar_index, _top, labelText, style=label.style_label_down, color=color.new(color.black, 0), textcolor=color.white, size=size.tiny)
+        line ln = na
+        if showMidline
+            mid = f_mid(_top, _bot)
+            ln := line.new(bar_index, mid, bar_index + 1, mid, extend=extendRight ? extend.right : extend.none, color=color.new(color.gray, 40), style=line.style_dashed)
+        if showEntryLine
+            entry = _dir == 1 ? _bot : _top
+            line.new(bar_index, entry, bar_index + 1, entry, extend=extendRight ? extend.right : extend.none, color=color.new(color.yellow, 40), style=line.style_solid)
+
+        array.push(zoneBoxes, bx)
+        array.push(zoneLabels, lb)
+        array.push(zoneLines, ln)
+        array.push(zoneType, _type)
+        array.push(zoneDir, _dir)
+        array.push(zoneTop, _top)
+        array.push(zoneBot, _bot)
+        array.push(zoneCreated, bar_index)
+        array.push(zoneScore, score)
+        array.push(zoneTouches, touches)
+        array.push(zoneState, 0)
+        array.push(zoneIsIFVG, _isIFVG)
+        newZoneScore := score
+        f_prune_type(_type)
+        f_prune()
+        f_prune_labels()
+
+// Create FVG zones
+if fvgBullOk
+    createZone(0, 1, low, high[2], false)
+if fvgBearOk
+    createZone(0, -1, low[2], high, false)
+
+// Create OB zones
+if obOk
+    createZone(2, obDir, obTop, obBot, false)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zone updates: mitigation, invalidation, iFVG
+// ─────────────────────────────────────────────────────────────────────────────
+if array.size(zoneBoxes) > 0
+    maxIdx = math.min(array.size(zoneBoxes) - 1, maxLoop)
+    for i = maxIdx to 0 by -1
+        zTop = array.get(zoneTop, i)
+        zBot = array.get(zoneBot, i)
+        zDir = array.get(zoneDir, i)
+        zType = array.get(zoneType, i)
+        zState = array.get(zoneState, i)
+        zTouches = array.get(zoneTouches, i)
+        zCreated = array.get(zoneCreated, i)
+
+    // Expire
+        if bar_index - zCreated > expireBars
+            array.set(zoneState, i, 3)
+            f_remove_idx(i)
+            continue
+
+    // Mitigation detection
+        touched = (low <= zTop and high >= zBot)
+        if touched
+            zTouches += 1
+            array.set(zoneTouches, i, zTouches)
+            penetration = zDir == 1 ? (zTop - low) / math.max(0.0001, zTop - zBot) : (high - zBot) / math.max(0.0001, zTop - zBot)
+            mitigated = mitigationMode == "touch" ? true : mitigationMode == "% penetration" ? (penetration * 100 >= mitigationPercent) : (close <= zTop and close >= zBot)
+            if mitigated and zState == 0
+                array.set(zoneState, i, 1)
+                newRetestBar := true
+            fullFill = invalidateMode == "full fill" ? (zDir == 1 ? low <= zBot : high >= zTop) : invalidateMode == "close beyond" ? (zDir == 1 ? close < zBot : close > zTop) : (zDir == 1 ? low < zBot : high > zTop)
+            if fullFill
+                array.set(zoneState, i, 2)
+                f_remove_idx(i)
+                continue
+
+    // iFVG flip
+        if zType == 0 and zState >= 1 and not array.get(zoneIsIFVG, i)
+            mid = f_mid(zTop, zBot)
+            flipOk = flipTrigger == "close beyond midpoint" ? (zDir == 1 ? close < mid : close > mid) :
+              flipTrigger == "impulse away" ? (zDir == 1 ? impulseDn : impulseUp) :
+              flipTrigger == "BOS" ? (zDir == 1 ? bosDn : bosUp) : (zDir == 1 ? bosDn : bosUp)
+            if flipOk and (bar_index - zCreated) <= flipLookback and (not requireRetestAfterFlip or touched)
+                array.set(zoneIsIFVG, i, true)
+                newIFVGBar := true
+                bx = array.get(zoneBoxes, i)
+                if not na(bx)
+                    box.set_border_style(bx, line.style_dotted)
+                lb = array.get(zoneLabels, i)
+                if not na(lb)
+                    label.set_text(lb, "iFVG " + str.tostring(array.get(zoneScore, i)))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Confirmations & Alerts
+// ─────────────────────────────────────────────────────────────────────────────
+confirmVolume = confirmVol ? (useZScoreVol ? volZ > 1.0 : rvol > 1.5) : true
+confirmStructure = confirmStruct ? (bosUp or bosDn) : true
+confirmRejection = confirmReject ? (math.abs(close - open) < (high - low) * 0.4 and (high - close) > (high - low) * 0.5) : true
+confirmMomentum = confirmMomentum ? (roc > 0 or ema > ema[1]) : true
+confirmMitigate = confirmMitigation ? (low <= close and high >= close) : true
+
+zoneCreatedAlert = (fvgBullOk or fvgBearOk or obOk) and barstate.isconfirmed and (not na(newZoneScore) and newZoneScore >= minScoreToAlert)
+
+alertcondition(zoneCreatedAlert, "Zone Created", "Zone created")
+alertcondition(newRetestBar, "Zone Retest", "Zone retested / mitigated")
+alertcondition(confirmVolume and confirmStructure and confirmRejection and confirmMomentum and confirmMitigate, "Confirmation", "Confirmation triggered")
+
+// iFVG alert
+alertcondition(newIFVGBar, "iFVG", "iFVG generated")
+
+// Closest zone display toggle (soft hide others)
+if showClosestOnly and array.size(zoneBoxes) > 0
+    closestIdx = 0
+    closestDist = math.abs(close - f_mid(array.get(zoneTop, 0), array.get(zoneBot, 0)))
+    for i = 1 to math.min(array.size(zoneBoxes)-1, maxLoop)
+        dist = math.abs(close - f_mid(array.get(zoneTop, i), array.get(zoneBot, i)))
+        if dist < closestDist
+            closestDist := dist
+            closestIdx := i
+    for i = 0 to math.min(array.size(zoneBoxes)-1, maxLoop)
+        bx = array.get(zoneBoxes, i)
+        lb = array.get(zoneLabels, i)
+        if not na(bx)
+            if i == closestIdx
+                box.set_bgcolor(bx, f_makeColor(array.get(zoneDir, i), array.get(zoneScore, i)))
+                box.set_border_color(bx, color.new(color.gray, 0))
+            else
+                box.set_bgcolor(bx, color.new(color.gray, 95))
+                box.set_border_color(bx, color.new(color.gray, 95))
+        if not na(lb)
+            if i == closestIdx
+                label.set_textcolor(lb, color.white)
+            else
+                label.set_textcolor(lb, color.new(color.white, 100))
+if not showClosestOnly and array.size(zoneBoxes) > 0
+    for i = 0 to math.min(array.size(zoneBoxes)-1, maxLoop)
+        bx = array.get(zoneBoxes, i)
+        lb = array.get(zoneLabels, i)
+        if not na(bx)
+            box.set_bgcolor(bx, f_makeColor(array.get(zoneDir, i), array.get(zoneScore, i)))
+            box.set_border_color(bx, color.new(color.gray, 0))
+        if not na(lb)
+            label.set_textcolor(lb, color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MTF (optional, safe)
+// ─────────────────────────────────────────────────────────────────────────────
+if useMTF
+    mtfFvgBull = request.security(syminfo.tickerid, mtfTf, low > high[2], barmerge.gaps_off, barmerge.lookahead_off)
+    mtfFvgBear = request.security(syminfo.tickerid, mtfTf, high < low[2], barmerge.gaps_off, barmerge.lookahead_off)
+    mtfBullTop = request.security(syminfo.tickerid, mtfTf, low, barmerge.gaps_off, barmerge.lookahead_off)
+    mtfBullBot = request.security(syminfo.tickerid, mtfTf, high[2], barmerge.gaps_off, barmerge.lookahead_off)
+    mtfBearTop = request.security(syminfo.tickerid, mtfTf, low[2], barmerge.gaps_off, barmerge.lookahead_off)
+    mtfBearBot = request.security(syminfo.tickerid, mtfTf, high, barmerge.gaps_off, barmerge.lookahead_off)
+    if mtfFvgBull
+        createZone(0, 1, mtfBullTop, mtfBullBot, false)
+    if mtfFvgBear
+        createZone(0, -1, mtfBearTop, mtfBearBot, false)
+
+// Changelog:
+// - Migration Pine v6 (types/bool casting/guards).
+// - Suppression des zones invalidées, gardes d'index/arrays renforcés.
+// - MTF conservé avec lookahead_off + corrections de bornes FVG.
