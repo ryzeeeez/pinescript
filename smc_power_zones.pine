@@ -188,7 +188,8 @@ var int[] zoneState = array.new_int() // 0 fresh,1 partial,2 full,3 expired
 var bool[] zoneIsIFVG = array.new_bool()
 var bool newIFVGBar = false
 var bool newRetestBar = false
-var int newZoneScore = na
+var int newZoneScore = 0
+var bool hasNewZoneScore = false
 
 f_zoneCountByType(_type) =>
     count = 0
@@ -267,7 +268,8 @@ f_borderWidth(_score) => _score >= strongThreshold ? 2 : 1
 
 newIFVGBar := false
 newRetestBar := false
-newZoneScore := na
+newZoneScore := 0
+hasNewZoneScore := false
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Detection FVG
@@ -356,6 +358,7 @@ createZone(_type, _dir, _top, _bot, _isIFVG) =>
         array.push(zoneState, 0)
         array.push(zoneIsIFVG, _isIFVG)
         newZoneScore := score
+        hasNewZoneScore := true
         f_prune_type(_type)
         f_prune()
         f_prune_labels()
@@ -431,7 +434,7 @@ confirmRejection = confirmReject ? (math.abs(close - open) < (high - low) * 0.4 
 confirmMomentum = confirmMomentum ? (roc > 0 or ema > ema[1]) : true
 confirmMitigate = confirmMitigation ? (low <= close and high >= close) : true
 
-zoneCreatedAlert = (fvgBullOk or fvgBearOk or obOk) and barstate.isconfirmed and (not na(newZoneScore) and newZoneScore >= minScoreToAlert)
+zoneCreatedAlert = (fvgBullOk or fvgBearOk or obOk) and barstate.isconfirmed and (hasNewZoneScore and newZoneScore >= minScoreToAlert)
 
 alertcondition(zoneCreatedAlert, "Zone Created", "Zone created")
 alertcondition(newRetestBar, "Zone Retest", "Zone retested / mitigated")
